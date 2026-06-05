@@ -1,0 +1,128 @@
+# =========================================================
+# CI/CD: SAST (SonarQube) -> Quality Gate -> Build -> Deploy
+# Tanpa registry. Build & deploy di host runner yang sama (shell runner + docker).
+#
+# Variables wajib (Settings > CI/CD > Variables, Masked utk sensitif):
+#   SONAR_HOST_URL, SONAR_TOKEN (masked), SONAR_PROJECT_KEY
+#   DBUSER (masked), DBPASS (masked)
+#   APP_PORT  (mis. 10001)
+# =========================================================
+
+stages:
+  - sast
+  - quality-gate
+  - build
+  - deploy
+
+variables:
+  APP_NAME: "mongection"
+  IMAGE_TAG: "mongection:$CI_COMMIT_SHORT_SHA"
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+default:
+  - tags:
+    - group-1
+  - before_script:
+    - echo "Start job ${CI_JOB_NAME} at $(date)"
+  - after_script:
+    - echo "Finish job ${CI_JOB_NAME} at $(date), with status ${CI_JOB_STATUS}"
+
+# ---------------------------------------------------------
+# 1) SAST - SonarQube Scanner
+# ---------------------------------------------------------
+sast:sonarqube:
+  stage: sast
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  script:
+    - echo "===== STATE: Menjalankan SAST SonarQube ====="
+    - echo "Project Key : $SONAR_PROJECT_KEY"
+    - echo "Sonar Host  : $SONAR_HOST_URL"
+    - sonar-scanner
+        -Dsonar.host.url="$SONAR_HOST_URL"
+        -Dsonar.login="$SONAR_TOKEN"
+        -Dsonar.projectKey="$SONAR_PROJECT_KEY"
+        -Dsonar.qualitygate.wait=false
+    - echo "STATE: SAST selesai"
+
+# ---------------------------------------------------------
+# 2) Quality Gate - HARD (block pipeline kalau FAIL)
+# ---------------------------------------------------------
+quality-gate:hard:
+  stage: quality-gate
+  image: curlimages/curl:latest
+  script:
+    - echo "===== STATE: Cek Quality Gate (HARD) ====="
+    - |
+      STATUS=$(curl -s -u "$SONAR_TOKEN:" \
+        "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY" \
+        | grep -o '"status":"[A-Z]*"' | head -1 | cut -d'"' -f4)
+      echo "Quality Gate Status: $STATUS"
+      if [ "$STATUS" != "OK" ]; then
+        echo "STATE: HARD GATE FAILED -> pipeline berhenti"
+        exit 1
+      fi
+      echo "STATE: HARD GATE PASSED"
+
+# ---------------------------------------------------------
+# 3) Quality Gate - SOFT (warning, tidak block)
+# ---------------------------------------------------------
+quality-gate:soft:
+  stage: quality-gate
+  image: curlimages/curl:latest
+  allow_failure: true
+  script:
+    - echo "===== STATE: Cek Quality Gate (SOFT) ====="
+    - |
+      RESP=$(curl -s -u "$SONAR_TOKEN:" \
+        "$SONAR_HOST_URL/api/measures/component?component=$SONAR_PROJECT_KEY&metricKeys=bugs,vulnerabilities,code_smells,coverage")
+      echo "Metrics: $RESP"
+      echo "STATE: SOFT GATE selesai (warning only)"
+
+# ---------------------------------------------------------
+# 4) Build - Docker image lokal di runner (tanpa registry)
+# ---------------------------------------------------------
+build:image:
+  stage: build
+  script:
+    - echo "===== STATE: Build image $IMAGE_TAG ====="
+    - docker build -t "$IMAGE_TAG" -t "${APP_NAME}:latest" .
+    - echo "STATE: Build selesai"
+    - docker images | grep "$APP_NAME"
+
+# ---------------------------------------------------------
+# 5) Deploy - jalankan mongo + app di host runner
+# ---------------------------------------------------------
+deploy:app:
+  stage: deploy
+  script:
+    - echo "===== STATE: Deploy $APP_NAME ====="
+
+    - echo "--- STATE: Siapkan network ---"
+    - docker network inspect ${APP_NAME}-net >/dev/null 2>&1 || docker network create ${APP_NAME}-net
+
+    - echo "--- STATE: Jalankan MongoDB ---"
+    - docker rm -f ${APP_NAME}-mongo 2>/dev/null || true
+    - docker run -d --name ${APP_NAME}-mongo
+        --network ${APP_NAME}-net
+        --network-alias mongo
+        -e MONGO_INITDB_ROOT_USERNAME="$DBUSER"
+        -e MONGO_INITDB_ROOT_PASSWORD="$DBPASS"
+        mongo:5
+
+    - echo "--- STATE: Restart container app ---"
+    - docker rm -f ${APP_NAME}-app 2>/dev/null || true
+    - docker run -d --name ${APP_NAME}-app
+        --network ${APP_NAME}-net
+        -e DBUSER="$DBUSER"
+        -e DBPASS="$DBPASS"
+        -p ${APP_PORT}:10001
+        "$IMAGE_TAG"
+
+    - echo "--- STATE: Status container ---"
+    - docker ps --filter name=${APP_NAME}
+    - echo "STATE: Deploy berhasil di port $APP_PORT"
